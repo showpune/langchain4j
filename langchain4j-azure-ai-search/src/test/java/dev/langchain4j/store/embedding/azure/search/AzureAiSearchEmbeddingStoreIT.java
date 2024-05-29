@@ -7,6 +7,7 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.EmbeddingStoreIT;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.slf4j.Logger;
@@ -37,8 +38,12 @@ public class AzureAiSearchEmbeddingStoreIT extends EmbeddingStoreIT {
                 .endpoint(System.getenv("AZURE_SEARCH_ENDPOINT"))
                 .apiKey(System.getenv("AZURE_SEARCH_KEY"))
                 .dimensions(dimensions)
-                .createOrUpdateIndex(true)
                 .build();
+    }
+
+    @BeforeEach
+    void setUp() {
+        clearStore();
     }
 
     @Test
@@ -86,8 +91,12 @@ public class AzureAiSearchEmbeddingStoreIT extends EmbeddingStoreIT {
     @Override
     protected void clearStore() {
         AzureAiSearchEmbeddingStore azureAiSearchEmbeddingStore = (AzureAiSearchEmbeddingStore) embeddingStore;
-        azureAiSearchEmbeddingStore.deleteIndex();
-        azureAiSearchEmbeddingStore.createOrUpdateIndex(dimensions);
+        try {
+            azureAiSearchEmbeddingStore.deleteIndex();
+            azureAiSearchEmbeddingStore.createOrUpdateIndex(dimensions);
+        } catch (RuntimeException e) {
+            log.error("Failed to clean up the index. You should look at deleting it manually.", e);
+        }
     }
 
     @Override

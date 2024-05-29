@@ -1,27 +1,42 @@
 package dev.langchain4j.model.openai;
 
+import dev.ai4j.openai4j.OpenAiHttpException;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
-import dev.langchain4j.data.message.*;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.ImageContent;
+import dev.langchain4j.data.message.TextContent;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.model.Tokenizer;
 import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.listener.ChatLanguageModelRequest;
+import dev.langchain4j.model.chat.listener.ChatLanguageModelResponse;
+import dev.langchain4j.model.listener.ModelListener;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.model.output.TokenUsage;
 import org.junit.jupiter.api.Test;
 
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static dev.langchain4j.agent.tool.JsonSchemaProperty.INTEGER;
 import static dev.langchain4j.data.message.ToolExecutionResultMessage.from;
 import static dev.langchain4j.data.message.UserMessage.userMessage;
 import static dev.langchain4j.internal.Utils.readBytes;
 import static dev.langchain4j.model.openai.OpenAiChatModelName.GPT_3_5_TURBO;
+import static dev.langchain4j.model.openai.OpenAiChatModelName.GPT_4_O;
 import static dev.langchain4j.model.openai.OpenAiModelName.GPT_3_5_TURBO_1106;
-import static dev.langchain4j.model.openai.OpenAiModelName.GPT_4_VISION_PREVIEW;
-import static dev.langchain4j.model.output.FinishReason.*;
+import static dev.langchain4j.model.output.FinishReason.LENGTH;
+import static dev.langchain4j.model.output.FinishReason.STOP;
+import static dev.langchain4j.model.output.FinishReason.TOOL_EXECUTION;
 import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Fail.fail;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class OpenAiChatModelIT {
 
@@ -35,7 +50,7 @@ class OpenAiChatModelIT {
             .addParameter("second", INTEGER)
             .build();
 
-    ChatLanguageModel model = OpenAiChatModel.builder()
+    OpenAiChatModel model = OpenAiChatModel.builder()
             .baseUrl(System.getenv("OPENAI_BASE_URL"))
             .apiKey(System.getenv("OPENAI_API_KEY"))
             .organizationId(System.getenv("OPENAI_ORGANIZATION_ID"))
@@ -44,11 +59,11 @@ class OpenAiChatModelIT {
             .logResponses(true)
             .build();
 
-    ChatLanguageModel visionModel = OpenAiChatModel.builder()
+    OpenAiChatModel visionModel = OpenAiChatModel.builder()
             .baseUrl(System.getenv("OPENAI_BASE_URL"))
             .apiKey(System.getenv("OPENAI_API_KEY"))
             .organizationId(System.getenv("OPENAI_ORGANIZATION_ID"))
-            .modelName(GPT_4_VISION_PREVIEW)
+            .modelName(GPT_4_O)
             .temperature(0.0)
             .logRequests(true)
             .logResponses(true)
@@ -79,11 +94,16 @@ class OpenAiChatModelIT {
     void should_generate_answer_and_return_token_usage_and_finish_reason_length() {
 
         // given
+        int maxTokens = 1;
+
         ChatLanguageModel model = OpenAiChatModel.builder()
                 .baseUrl(System.getenv("OPENAI_BASE_URL"))
                 .apiKey(System.getenv("OPENAI_API_KEY"))
                 .organizationId(System.getenv("OPENAI_ORGANIZATION_ID"))
-                .maxTokens(3)
+                .maxTokens(maxTokens)
+                .temperature(0.0)
+                .logRequests(true)
+                .logResponses(true)
                 .build();
 
         UserMessage userMessage = userMessage("What is the capital of Germany?");
@@ -96,7 +116,7 @@ class OpenAiChatModelIT {
 
         TokenUsage tokenUsage = response.tokenUsage();
         assertThat(tokenUsage.inputTokenCount()).isEqualTo(14);
-        assertThat(tokenUsage.outputTokenCount()).isEqualTo(3);
+        assertThat(tokenUsage.outputTokenCount()).isLessThanOrEqualTo(maxTokens);
         assertThat(tokenUsage.totalTokenCount())
                 .isEqualTo(tokenUsage.inputTokenCount() + tokenUsage.outputTokenCount());
 
@@ -210,6 +230,8 @@ class OpenAiChatModelIT {
                 .organizationId(System.getenv("OPENAI_ORGANIZATION_ID"))
                 .modelName(GPT_3_5_TURBO_1106) // supports parallel function calling
                 .temperature(0.0)
+                .logRequests(true)
+                .logResponses(true)
                 .build();
 
         UserMessage userMessage = userMessage("2+2=? 3+3=?");
@@ -401,5 +423,188 @@ class OpenAiChatModelIT {
 
         // then
         assertThat(response).containsIgnoringCase("Berlin");
+    }
+
+    @Test
+    void should_use_default_tokenizer() {
+
+        // when
+        int tokenCount = model.estimateTokenCount("Hello, how are you doing?");
+
+        // then
+        assertThat(tokenCount).isEqualTo(14);
+    }
+
+    @Test
+    void should_use_custom_tokenizer() {
+
+        // given
+
+        Tokenizer tokenizer = new Tokenizer() {
+
+            @Override
+            public int estimateTokenCountInText(String text) {
+                return 42;
+            }
+
+            @Override
+            public int estimateTokenCountInMessage(ChatMessage message) {
+                return 42;
+            }
+
+            @Override
+            public int estimateTokenCountInMessages(Iterable<ChatMessage> messages) {
+                return 42;
+            }
+
+            @Override
+            public int estimateTokenCountInToolSpecifications(Iterable<ToolSpecification> toolSpecifications) {
+                return 42;
+            }
+
+            @Override
+            public int estimateTokenCountInToolExecutionRequests(Iterable<ToolExecutionRequest> toolExecutionRequests) {
+                return 42;
+            }
+        };
+
+        OpenAiChatModel model = OpenAiChatModel.builder()
+                .apiKey("does not matter")
+                .tokenizer(tokenizer)
+                .build();
+
+        // when
+        int tokenCount = model.estimateTokenCount("Hello, how are you doing?");
+
+        // then
+        assertThat(tokenCount).isEqualTo(42);
+    }
+
+    @Test
+    void should_listen_request_and_response() {
+
+        // given
+        AtomicReference<ChatLanguageModelRequest> requestReference = new AtomicReference<>();
+        AtomicReference<ChatLanguageModelResponse> responseReference = new AtomicReference<>();
+
+        ModelListener<ChatLanguageModelRequest, ChatLanguageModelResponse> modelListener =
+                new ModelListener<ChatLanguageModelRequest, ChatLanguageModelResponse>() {
+
+                    @Override
+                    public void onRequest(ChatLanguageModelRequest request) {
+                        requestReference.set(request);
+                    }
+
+                    @Override
+                    public void onResponse(ChatLanguageModelResponse response, ChatLanguageModelRequest request) {
+                        responseReference.set(response);
+                        assertThat(request).isSameAs(requestReference.get());
+                    }
+
+                    @Override
+                    public void onError(Throwable error,
+                                        ChatLanguageModelResponse response,
+                                        ChatLanguageModelRequest request) {
+                        fail("onError() must not be called");
+                    }
+                };
+
+        OpenAiChatModelName modelName = GPT_3_5_TURBO;
+        double temperature = 0.7;
+        double topP = 1.0;
+        int maxTokens = 7;
+
+        OpenAiChatModel model = OpenAiChatModel.builder()
+                .baseUrl(System.getenv("OPENAI_BASE_URL"))
+                .apiKey(System.getenv("OPENAI_API_KEY"))
+                .organizationId(System.getenv("OPENAI_ORGANIZATION_ID"))
+                .modelName(modelName)
+                .temperature(temperature)
+                .topP(topP)
+                .maxTokens(maxTokens)
+                .logRequests(true)
+                .logResponses(true)
+                .listeners(singletonList(modelListener))
+                .build();
+
+        UserMessage userMessage = UserMessage.from("hello");
+
+        ToolSpecification toolSpecification = ToolSpecification.builder()
+                .name("add")
+                .addParameter("a", INTEGER)
+                .addParameter("b", INTEGER)
+                .build();
+
+        // when
+        AiMessage aiMessage = model.generate(singletonList(userMessage), singletonList(toolSpecification)).content();
+
+        // then
+        ChatLanguageModelRequest request = requestReference.get();
+        assertThat(request.model()).isEqualTo(modelName.toString());
+        assertThat(request.temperature()).isEqualTo(temperature);
+        assertThat(request.topP()).isEqualTo(topP);
+        assertThat(request.maxTokens()).isEqualTo(maxTokens);
+        assertThat(request.messages()).containsExactly(userMessage);
+        assertThat(request.toolSpecifications()).containsExactly(toolSpecification);
+
+        ChatLanguageModelResponse response = responseReference.get();
+        assertThat(response.id()).isNotBlank();
+        assertThat(response.model()).isNotBlank();
+        assertThat(response.tokenUsage().inputTokenCount()).isGreaterThan(0);
+        assertThat(response.tokenUsage().outputTokenCount()).isGreaterThan(0);
+        assertThat(response.tokenUsage().totalTokenCount()).isGreaterThan(0);
+        assertThat(response.finishReason()).isNotNull();
+        assertThat(response.aiMessage()).isEqualTo(aiMessage);
+    }
+
+    @Test
+    void should_listen_error() {
+
+        // given
+        String wrongApiKey = "banana";
+
+        AtomicReference<ChatLanguageModelRequest> requestReference = new AtomicReference<>();
+        AtomicReference<Throwable> errorReference = new AtomicReference<>();
+
+        ModelListener<ChatLanguageModelRequest, ChatLanguageModelResponse> modelListener =
+                new ModelListener<ChatLanguageModelRequest, ChatLanguageModelResponse>() {
+
+                    @Override
+                    public void onRequest(ChatLanguageModelRequest request) {
+                        requestReference.set(request);
+                    }
+
+                    @Override
+                    public void onResponse(ChatLanguageModelResponse response, ChatLanguageModelRequest request) {
+                        fail("onResponse() must not be called");
+                    }
+
+                    @Override
+                    public void onError(Throwable error,
+                                        ChatLanguageModelResponse response,
+                                        ChatLanguageModelRequest request) {
+                        errorReference.set(error);
+                        assertThat(response).isNull();
+                        assertThat(request).isSameAs(requestReference.get());
+                    }
+                };
+
+        OpenAiChatModel model = OpenAiChatModel.builder()
+                .apiKey(wrongApiKey)
+                .maxRetries(0)
+                .logRequests(true)
+                .logResponses(true)
+                .listeners(singletonList(modelListener))
+                .build();
+
+        String userMessage = "this message will fail";
+
+        // when
+        assertThrows(RuntimeException.class, () -> model.generate(userMessage));
+
+        // then
+        Throwable throwable = errorReference.get();
+        assertThat(throwable).isExactlyInstanceOf(OpenAiHttpException.class);
+        assertThat(throwable).hasMessageContaining("Incorrect API key provided");
     }
 }

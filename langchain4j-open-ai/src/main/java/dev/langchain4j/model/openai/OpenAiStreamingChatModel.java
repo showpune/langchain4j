@@ -12,21 +12,27 @@ import dev.langchain4j.model.StreamingResponseHandler;
 import dev.langchain4j.model.Tokenizer;
 import dev.langchain4j.model.chat.StreamingChatLanguageModel;
 import dev.langchain4j.model.chat.TokenCountEstimator;
+import dev.langchain4j.model.chat.listener.ChatLanguageModelRequest;
+import dev.langchain4j.model.chat.listener.ChatLanguageModelResponse;
+import dev.langchain4j.model.listener.ModelListener;
 import dev.langchain4j.model.openai.spi.OpenAiStreamingChatModelBuilderFactory;
 import dev.langchain4j.model.output.Response;
 import lombok.Builder;
+import lombok.extern.slf4j.Slf4j;
 
 import java.net.Proxy;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
-import static dev.langchain4j.internal.Utils.getOrDefault;
-import static dev.langchain4j.internal.Utils.isNullOrEmpty;
+import static dev.langchain4j.internal.Utils.*;
 import static dev.langchain4j.model.openai.InternalOpenAiHelper.*;
 import static dev.langchain4j.model.openai.OpenAiModelName.GPT_3_5_TURBO;
 import static dev.langchain4j.spi.ServiceHelper.loadFactories;
 import static java.time.Duration.ofSeconds;
+import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
 
 /**
@@ -34,6 +40,7 @@ import static java.util.Collections.singletonList;
  * The model's response is streamed token by token and should be handled with {@link StreamingResponseHandler}.
  * You can find description of parameters <a href="https://platform.openai.com/docs/api-reference/chat/create">here</a>.
  */
+@Slf4j
 public class OpenAiStreamingChatModel implements StreamingChatLanguageModel, TokenCountEstimator {
 
     private final OpenAiClient client;
@@ -49,6 +56,8 @@ public class OpenAiStreamingChatModel implements StreamingChatLanguageModel, Tok
     private final Integer seed;
     private final String user;
     private final Tokenizer tokenizer;
+    private final boolean isOpenAiModel;
+    private final List<ModelListener<ChatLanguageModelRequest, ChatLanguageModelResponse>> listeners;
 
     @Builder
     public OpenAiStreamingChatModel(String baseUrl,
@@ -69,7 +78,9 @@ public class OpenAiStreamingChatModel implements StreamingChatLanguageModel, Tok
                                     Proxy proxy,
                                     Boolean logRequests,
                                     Boolean logResponses,
-                                    Tokenizer tokenizer) {
+                                    Tokenizer tokenizer,
+                                    Map<String, String> customHeaders,
+                                    List<ModelListener<ChatLanguageModelRequest, ChatLanguageModelResponse>> listeners) {
 
         timeout = getOrDefault(timeout, ofSeconds(60));
 
@@ -85,6 +96,7 @@ public class OpenAiStreamingChatModel implements StreamingChatLanguageModel, Tok
                 .logRequests(logRequests)
                 .logStreamingResponses(logResponses)
                 .userAgent(DEFAULT_USER_AGENT)
+                .customHeaders(customHeaders)
                 .build();
         this.modelName = getOrDefault(modelName, GPT_3_5_TURBO);
         this.temperature = getOrDefault(temperature, 0.7);
@@ -97,7 +109,9 @@ public class OpenAiStreamingChatModel implements StreamingChatLanguageModel, Tok
         this.responseFormat = responseFormat;
         this.seed = seed;
         this.user = user;
-        this.tokenizer = getOrDefault(tokenizer, () -> new OpenAiTokenizer(this.modelName));
+        this.tokenizer = getOrDefault(tokenizer, OpenAiTokenizer::new);
+        this.isOpenAiModel = isOpenAiModel(this.modelName);
+        this.listeners = listeners == null ? emptyList() : new ArrayList<>(listeners);
     }
 
     public String modelName() {
@@ -139,32 +153,100 @@ public class OpenAiStreamingChatModel implements StreamingChatLanguageModel, Tok
                 .seed(seed)
                 .user(user);
 
-        int inputTokenCount = tokenizer.estimateTokenCountInMessages(messages);
-
         if (toolThatMustBeExecuted != null) {
             requestBuilder.tools(toTools(singletonList(toolThatMustBeExecuted)));
             requestBuilder.toolChoice(toolThatMustBeExecuted.name());
-            inputTokenCount += tokenizer.estimateTokenCountInForcefulToolSpecification(toolThatMustBeExecuted);
         } else if (!isNullOrEmpty(toolSpecifications)) {
             requestBuilder.tools(toTools(toolSpecifications));
-            inputTokenCount += tokenizer.estimateTokenCountInToolSpecifications(toolSpecifications);
         }
 
         ChatCompletionRequest request = requestBuilder.build();
 
+        ChatLanguageModelRequest modelListenerRequest = createModelListenerRequest(request, messages, toolSpecifications);
+        listeners.forEach(listener -> {
+            try {
+                listener.onRequest(modelListenerRequest);
+            } catch (Exception e) {
+                log.warn("Exception while calling model listener", e);
+            }
+        });
+
+        int inputTokenCount = countInputTokens(messages, toolSpecifications, toolThatMustBeExecuted);
         OpenAiStreamingResponseBuilder responseBuilder = new OpenAiStreamingResponseBuilder(inputTokenCount);
+
+        AtomicReference<String> responseId = new AtomicReference<>();
+        AtomicReference<String> responseModel = new AtomicReference<>();
 
         client.chatCompletion(request)
                 .onPartialResponse(partialResponse -> {
                     responseBuilder.append(partialResponse);
                     handle(partialResponse, handler);
+
+                    if (!isNullOrBlank(partialResponse.id())) {
+                        responseId.set(partialResponse.id());
+                    }
+                    if (!isNullOrBlank(partialResponse.model())) {
+                        responseModel.set(partialResponse.model());
+                    }
                 })
                 .onComplete(() -> {
-                    Response<AiMessage> response = responseBuilder.build(tokenizer, toolThatMustBeExecuted != null);
+                    Response<AiMessage> response = createResponse(responseBuilder, toolThatMustBeExecuted);
+
+                    ChatLanguageModelResponse modelListenerResponse = createModelListenerResponse(
+                            responseId.get(),
+                            responseModel.get(),
+                            response
+                    );
+                    listeners.forEach(listener -> {
+                        try {
+                            listener.onResponse(modelListenerResponse, modelListenerRequest);
+                        } catch (Exception e) {
+                            log.warn("Exception while calling model listener", e);
+                        }
+                    });
+
                     handler.onComplete(response);
                 })
-                .onError(handler::onError)
+                .onError(error -> {
+                    Response<AiMessage> response = createResponse(responseBuilder, toolThatMustBeExecuted);
+
+                    ChatLanguageModelResponse modelListenerResponse = createModelListenerResponse(
+                            responseId.get(),
+                            responseModel.get(),
+                            response
+                    );
+                    listeners.forEach(listener -> {
+                        try {
+                            listener.onError(error, modelListenerResponse, modelListenerRequest);
+                        } catch (Exception e) {
+                            log.warn("Exception while calling model listener", e);
+                        }
+                    });
+
+                    handler.onError(error);
+                })
                 .execute();
+    }
+
+    private Response<AiMessage> createResponse(OpenAiStreamingResponseBuilder responseBuilder,
+                                               ToolSpecification toolThatMustBeExecuted) {
+        Response<AiMessage> response = responseBuilder.build(tokenizer, toolThatMustBeExecuted != null);
+        if (isOpenAiModel) {
+            return response;
+        }
+        return removeTokenUsage(response);
+    }
+
+    private int countInputTokens(List<ChatMessage> messages,
+                                 List<ToolSpecification> toolSpecifications,
+                                 ToolSpecification toolThatMustBeExecuted) {
+        int inputTokenCount = tokenizer.estimateTokenCountInMessages(messages);
+        if (toolThatMustBeExecuted != null) {
+            inputTokenCount += tokenizer.estimateTokenCountInForcefulToolSpecification(toolThatMustBeExecuted);
+        } else if (!isNullOrEmpty(toolSpecifications)) {
+            inputTokenCount += tokenizer.estimateTokenCountInToolSpecifications(toolSpecifications);
+        }
+        return inputTokenCount;
     }
 
     private static void handle(ChatCompletionResponse partialResponse,
