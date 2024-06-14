@@ -6,6 +6,9 @@ import com.azure.core.credential.KeyCredential;
 import com.azure.core.credential.TokenCredential;
 import com.azure.core.exception.HttpResponseException;
 import com.azure.core.http.ProxyOptions;
+import com.azure.core.http.policy.UserAgentPolicy;
+import com.azure.core.http.rest.RequestOptions;
+import com.azure.core.util.Context;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
@@ -15,6 +18,7 @@ import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.chat.TokenCountEstimator;
 import dev.langchain4j.model.output.FinishReason;
 import dev.langchain4j.model.output.Response;
+import jdk.internal.joptsimple.internal.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -74,6 +78,7 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
     private final AzureChatEnhancementConfiguration enhancements;
     private final Long seed;
     private final ChatCompletionsResponseFormat responseFormat;
+    private final String appendUserAgent;
 
     public AzureOpenAiChatModel(OpenAIClient client,
                                 String deploymentName,
@@ -90,9 +95,10 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                                 List<AzureChatExtensionConfiguration> dataSources,
                                 AzureChatEnhancementConfiguration enhancements,
                                 Long seed,
-                                ChatCompletionsResponseFormat responseFormat) {
+                                ChatCompletionsResponseFormat responseFormat,
+                                String appendUserAgent) {
 
-        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat);
+        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat, appendUserAgent);
         this.client = client;
     }
 
@@ -117,10 +123,11 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                                 Duration timeout,
                                 Integer maxRetries,
                                 ProxyOptions proxyOptions,
-                                boolean logRequestsAndResponses) {
+                                boolean logRequestsAndResponses,
+                                String appendUserAgent) {
 
-        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat);
-        this.client = setupSyncClient(endpoint, serviceVersion, apiKey, timeout, maxRetries, proxyOptions, logRequestsAndResponses);
+        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat, appendUserAgent);
+        this.client = setupSyncClient(endpoint, serviceVersion, apiKey, timeout, maxRetries, proxyOptions, logRequestsAndResponses,appendUserAgent);
     }
 
     public AzureOpenAiChatModel(String endpoint,
@@ -144,10 +151,11 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                                 Duration timeout,
                                 Integer maxRetries,
                                 ProxyOptions proxyOptions,
-                                boolean logRequestsAndResponses) {
+                                boolean logRequestsAndResponses,
+                                String appendUserAgent) {
 
-        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat);
-        this.client = setupSyncClient(endpoint, serviceVersion, keyCredential, timeout, maxRetries, proxyOptions, logRequestsAndResponses);
+        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat, appendUserAgent);
+        this.client = setupSyncClient(endpoint, serviceVersion, keyCredential, timeout, maxRetries, proxyOptions, logRequestsAndResponses,appendUserAgent);
     }
 
     public AzureOpenAiChatModel(String endpoint,
@@ -171,10 +179,11 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                                 Duration timeout,
                                 Integer maxRetries,
                                 ProxyOptions proxyOptions,
-                                boolean logRequestsAndResponses) {
+                                boolean logRequestsAndResponses,
+                                String appendUserAgent) {
 
-        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat);
-        this.client = setupSyncClient(endpoint, serviceVersion, tokenCredential, timeout, maxRetries, proxyOptions, logRequestsAndResponses);
+        this(deploymentName, tokenizer, maxTokens, temperature, topP, logitBias, user, n, stop, presencePenalty, frequencyPenalty, dataSources, enhancements, seed, responseFormat, appendUserAgent);
+        this.client = setupSyncClient(endpoint, serviceVersion, tokenCredential, timeout, maxRetries, proxyOptions, logRequestsAndResponses,appendUserAgent);
     }
 
     private AzureOpenAiChatModel(String deploymentName,
@@ -191,7 +200,8 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                                  List<AzureChatExtensionConfiguration> dataSources,
                                  AzureChatEnhancementConfiguration enhancements,
                                  Long seed,
-                                 ChatCompletionsResponseFormat responseFormat) {
+                                 ChatCompletionsResponseFormat responseFormat,
+                                 String appendUserAgent) {
 
         this.deploymentName = getOrDefault(deploymentName, "gpt-35-turbo");
         this.tokenizer = tokenizer;
@@ -208,6 +218,7 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
         this.enhancements = enhancements;
         this.seed = seed;
         this.responseFormat = responseFormat;
+        this.appendUserAgent = appendUserAgent;
     }
 
     @Override
@@ -254,7 +265,15 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
         }
 
         try {
-            ChatCompletions chatCompletions = client.getChatCompletions(deploymentName, options);
+            RequestOptions requestOptions = new RequestOptions();
+            if (!Strings.isNullOrEmpty(appendUserAgent)) {
+                requestOptions.setContext(
+                        new Context(UserAgentPolicy.APPEND_USER_AGENT_CONTEXT_KEY, appendUserAgent));
+            } else {
+                requestOptions.setContext(
+                        new Context(UserAgentPolicy.OVERRIDE_USER_AGENT_CONTEXT_KEY, DEFAULT_USER_AGENT));
+            }
+            ChatCompletions chatCompletions = client.getChatCompletionsWithResponse(deploymentName, options, requestOptions).getValue();
             return Response.from(
                     aiMessageFrom(chatCompletions.getChoices().get(0).getMessage()),
                     tokenUsageFrom(chatCompletions.getUsage()),
@@ -310,6 +329,7 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
         private ProxyOptions proxyOptions;
         private boolean logRequestsAndResponses;
         private OpenAIClient openAIClient;
+        private String appendUserAgent;
 
         /**
          * Sets the Azure OpenAI endpoint. This is a mandatory parameter.
@@ -469,6 +489,11 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
             return this;
         }
 
+        public Builder appendUserAgent(String appendUserAgent) {
+            this.appendUserAgent = appendUserAgent;
+            return this;
+        }
+
         /**
          * Sets the Azure OpenAI client. This is an optional parameter, if you need more flexibility than using the endpoint, serviceVersion, apiKey, deploymentName parameters.
          *
@@ -505,7 +530,8 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                             timeout,
                             maxRetries,
                             proxyOptions,
-                            logRequestsAndResponses
+                            logRequestsAndResponses,
+                            appendUserAgent
                     );
                 } else if (keyCredential != null) {
                     return new AzureOpenAiChatModel(
@@ -530,7 +556,8 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                             timeout,
                             maxRetries,
                             proxyOptions,
-                            logRequestsAndResponses
+                            logRequestsAndResponses,
+                            appendUserAgent
                     );
                 }
                 return new AzureOpenAiChatModel(
@@ -555,7 +582,8 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                         timeout,
                         maxRetries,
                         proxyOptions,
-                        logRequestsAndResponses
+                        logRequestsAndResponses,
+                        appendUserAgent
                 );
             } else {
                 return new AzureOpenAiChatModel(
@@ -574,7 +602,8 @@ public class AzureOpenAiChatModel implements ChatLanguageModel, TokenCountEstima
                         dataSources,
                         enhancements,
                         seed,
-                        responseFormat
+                        responseFormat,
+                        appendUserAgent
                 );
             }
         }
